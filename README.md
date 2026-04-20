@@ -58,16 +58,16 @@ end
 Entities representing lists are fully [Enumerable](http://ruby-doc.org/core-2.2.0/Enumerable.html).
 
 ```ruby
-products.each  { |p| puts p.title }
-products.map(&:title)
+products.each  { |p| puts p.name }
+products.map(&:name)
 products.reduce(0) { |sum, p| sum + p.price }
 ```
 
 For paginated data sets, use `#full_set` to walk all pages automatically:
 
 ```ruby
-products.full_set.each  { |p| puts p.title }
-products.full_set.map(&:title)
+products.full_set.each  { |p| puts p.name }
+products.full_set.map(&:name)
 products.full_set.first(500)
 ```
 
