@@ -22,7 +22,7 @@ module Hyperlinked
         user_agent: USER_AGENT
       }.merge(options.dup)
 
-      @options[:cache_store] = @options[:cache_store] || Faraday::HttpCache::MemoryStore.new
+      @options[:cache_store] ||= BoundedMemoryStore.new
 
       conn &block if block_given?
     end
@@ -61,6 +61,38 @@ module Hyperlinked
       end
     end
 
+    def close
+      @conn = nil
+    end
+
+    # In-memory cache with a hard upper bound on entries to prevent unbounded growth.
+    # Evicts the oldest entry when the limit is reached.
+    class BoundedMemoryStore
+      DEFAULT_MAX_SIZE = 500
+
+      def initialize(max_size: DEFAULT_MAX_SIZE)
+        @store = {}
+        @max_size = max_size
+      end
+
+      def read(key)
+        @store[key]
+      end
+
+      def write(key, value)
+        @store.delete(@store.keys.first) if !@store.key?(key) && @store.size >= @max_size
+        @store[key] = value
+      end
+
+      def delete(key)
+        @store.delete(key)
+      end
+
+      def exist?(key)
+        @store.key?(key)
+      end
+    end
+
     class SafeCacheSerializer
       PREFIX = '__base64__:'.freeze
       PREFIX_EXP = %r{^#{PREFIX}}.freeze
@@ -81,9 +113,16 @@ module Hyperlinked
 
     private
 
+    DEFAULT_TIMEOUT = 20.freeze # seconds
+
     def conn(&block)
-      @conn ||= Faraday.new do |f|
-        cache_options = {serializer: SafeCacheSerializer, shared_cache: false, store: options[:cache_store]}
+      request_opts = {
+        timeout: (options[:timeout] || DEFAULT_TIMEOUT).to_i, # both read/open timeout
+        open_timeout: (options[:open_timeout] || DEFAULT_TIMEOUT).to_i # only open timeout
+      }
+
+      @conn ||= Faraday.new(request: request_opts) do |f|
+        cache_options = { serializer: SafeCacheSerializer, shared_cache: false, store: options[:cache_store] }
         cache_options[:logger] = options[:logger] if options[:logging]
 
         f.use :http_cache, **cache_options
@@ -102,6 +141,8 @@ module Hyperlinked
     end
 
     def validated_request!(verb, href, &block)
+      retries ||= 0
+
       resp = conn.send(verb) do |req|
         req.url href
         req.headers.update request_headers
@@ -110,13 +151,22 @@ module Hyperlinked
 
       raise_if_invalid! resp, "#{verb.upcase} #{href}"
       resp
+
+    rescue Faraday::ConnectionFailed, Faraday::TimeoutError => e
+      if (retries += 1) < 3 # max retries
+        puts "Got #{e.class} error, attempt #{retries}, retrying..."
+        retry
+      else
+        raise
+      end
     end
 
     def raise_if_invalid!(resp, url = nil)
-      raise ServerError.new("Server Error", url) if resp.status > 499
-      raise NotFoundError.new("Not Found", url) if resp.status == 404
-      raise UnauthorizedError.new("Unauthorized Request", url) if resp.status == 401
-      raise AccessForbiddenError.new("Access Forbidden", url) if resp.status == 403
+      raise ServerError.new('Server Error', url) if resp.status > 499
+      raise TooManyRequestsError.new('Too Many Requests', url) if resp.status == 429
+      raise NotFoundError.new('Not Found', url) if resp.status == 404
+      raise UnauthorizedError.new('Unauthorized Request', url) if resp.status == 401
+      raise AccessForbiddenError.new('Access Forbidden', url) if resp.status == 403
     end
 
     def sanitized(payload)

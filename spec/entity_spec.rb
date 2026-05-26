@@ -80,6 +80,18 @@ describe Hyperlinked::Entity do
       expect(entity.an_object.age).to eql(22)
       expect(entity.an_object.another_object).to be_a described_class
       expect(entity.an_object.another_object.foo).to eq 'bar'
+
+      expect(entity.an_object.dig('another_object', 'foo')).to eq('bar')
+      expect(entity.an_object.to_hash).to eq({"name"=>"Foobar", "age"=>22, "another_object"=>{"foo"=>"bar"}})
+      expect(entity.an_object.to_h).to eq({"name"=>"Foobar", "age"=>22, "another_object"=>{"foo"=>"bar"}})
+    end
+
+    it 'allows enumerating over property sets' do
+      expect(entity.an_object.respond_to?(:each_with_object)).to eq(true)
+      values = entity.an_object.map { |key, val| val }
+      expect(values[0]).to eq("Foobar")
+      expect(values[1]).to eq(22)
+      expect(values[2]).to be_a(Hyperlinked::Entity)
     end
 
     it 'has a #properties object' do
@@ -92,6 +104,18 @@ describe Hyperlinked::Entity do
       expect(entity.has?(:foobar)).to eql(false)
     end
 
+    it 'responds to #[]' do
+      expect(entity[:total_items]).to eql(10)
+      expect(entity[:items]).to be_a(Hyperlinked::Entity::EntityArray)
+      expect(entity[:foobar]).to eql(nil)
+    end
+
+    it 'responds to #try (same behaviour as [])' do
+      expect(entity.try(:total_items)).to eql(10)
+      expect(entity.try(:items)).to be_a(Hyperlinked::Entity::EntityArray)
+      expect(entity.try(:foobar)).to eql(nil)
+    end
+
     describe '#to_hash' do
       it 'returns original data' do
         expect(entity.to_hash).to eql(list_payload)
@@ -101,12 +125,12 @@ describe Hyperlinked::Entity do
     describe 'embedded entities' do
 
       it 'has a #entities object' do
-        expect(entity.entities[:items]).to be_a(Array)
+        expect(entity.entities[:items]).to be_a(Hyperlinked::Entity::EntityArray)
         expect(entity.entities[:items].first.entities[:shop]).to be_kind_of(Hyperlinked::Entity)
       end
 
       it 'are exposed like normal attributes' do
-        expect(entity.items).to be_kind_of(Array)
+        expect(entity.items).to be_kind_of(Hyperlinked::Entity::EntityArray)
         entity.items.first.tap do |product|
           expect(product).to be_kind_of(Hyperlinked::Entity)
           expect(product.title).to eql('iPhone 4')
@@ -125,9 +149,17 @@ describe Hyperlinked::Entity do
         end
       end
 
-      it 'includes FALSE values' do
+      it 'includes FALSE values, and allows querying with ?' do
         expect(entity.items.first.published).to be false
+        expect(entity.items.first.published?).to be false
+
         expect(entity.items.last.published).to be true
+        expect(entity.items.last.published?).to be true
+
+        expect(entity.items.first.has?(:published?)).to be true
+        expect(entity.items.first.has?(:published)).to be true
+        expect(entity.items.last.has?(:published)).to be true
+        expect(entity.items.last.has?(:published?)).to be true
       end
     end #/ embedded entities
 
@@ -189,16 +221,21 @@ describe Hyperlinked::Entity do
     end
 
     describe 'iterating' do
-      it 'is an enumerable if it is a list' do
+      it 'is an enumerable if it contains embedded items' do
         prods = []
-        entity.each{|pr| prods << pr}
-        expect(prods).to match_array(entity.items)
-        expect(entity.map{|pr| pr}).to match_array(entity.items)
+        entity.each { |pr| prods << pr }
+        expect(prods[0]).to eq(entity.items[0])
+        expect(prods[1]).to eq(entity.items[1])
+
+        mapped = entity.map{|pr| pr}
+        expect(mapped[0]).to eq(entity.items[0])
+        expect(mapped[1]).to eq(entity.items[1])
+
         expect(entity.reduce(0){|sum,e| sum + e.price.to_i}).to eql(24687)
         expect(entity.each).to be_kind_of(Enumerator)
       end
 
-      it 'is not treated as an array if not a list' do
+      it 'does not respond to each if no embedded items' do
         ent = Hyperlinked::Entity.new({'foo' => 'bar'}, client)
         expect(ent).not_to respond_to(:each)
       end
@@ -272,6 +309,48 @@ describe Hyperlinked::Entity do
     it 'does not break if response is empty string' do
       entity = Hyperlinked::Entity.new('', client)
       expect(entity.links).to eql({})
+    end
+  end
+
+  context 'memory leak prevention' do
+    let(:linked_payload) do
+      {
+        'title' => 'Root',
+        '_links' => {'next' => {'href' => '/page/2'}},
+        '_embedded' => {'items' => [{'title' => 'Child'}]}
+      }
+    end
+
+    it 'stores client as a WeakRef so entity graphs do not pin the strategy in memory' do
+      entity = described_class.new(linked_payload, client)
+      expect(entity.instance_variable_get(:@client)).to be_a(WeakRef)
+    end
+
+    it 'also wraps client as a WeakRef in embedded child entities' do
+      entity = described_class.new(linked_payload, client)
+      child = entity.entities[:items].first
+      expect(child.instance_variable_get(:@client)).to be_a(WeakRef)
+    end
+
+    it 'raises a descriptive error when the client has been garbage collected and a link is followed' do
+      entity = described_class.new(linked_payload, Object.new)
+      dead_ref = entity.instance_variable_get(:@client)
+      allow(dead_ref).to receive(:__getobj__).and_raise(WeakRef::RefError)
+      expect { entity.next }.to raise_error(RuntimeError, /garbage collected/)
+    end
+
+    it 'still exposes plain properties after the client is gone, because they are memoised at build time' do
+      entity = described_class.new(linked_payload, Object.new)
+      # warm the properties cache while the client is alive
+      _ = entity.properties
+      dead_ref = entity.instance_variable_get(:@client)
+      allow(dead_ref).to receive(:__getobj__).and_raise(WeakRef::RefError)
+      # reading already-memoised properties must not need the client
+      expect(entity.title).to eq 'Root'
+    end
+
+    it 'accepts a nil client without error' do
+      expect { described_class.new(linked_payload, nil) }.not_to raise_error
     end
   end
 

@@ -1,4 +1,4 @@
-require 'logger'
+require "logger"
 require "hyperlinked/version"
 require "hyperlinked/entity"
 require "hyperlinked/relation"
@@ -13,6 +13,7 @@ module Hyperlinked
 
     def client(strategy_name, client_opts = {}, &on_new_token)
       return @stubber if @stubber
+
       opts = client_opts.dup
       opts[:logging] = configuration.logging
       opts[:logger] = configuration.logger if configuration.logging
